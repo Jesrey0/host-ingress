@@ -1,0 +1,39 @@
+# Managed by host-ingress; install with scripts/deploy.
+[Unit]
+Description=Host public ingress (single stable ngrok endpoint)
+After=network-online.target host-ingress.service
+Wants=network-online.target host-ingress.service
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/host-ingress/env.ngrok
+ExecStart=%h/.local/bin/node %h/.config/host-ingress/runtime/current/transport/ngrok/transport.mjs run
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectHome=tmpfs
+BindReadOnlyPaths=%h/.local/bin/ngrok
+BindReadOnlyPaths=%h/.local/bin/node
+BindReadOnlyPaths=%h/.nvm/versions/node
+BindReadOnlyPaths=%h/.config/ngrok/ngrok.yml
+BindReadOnlyPaths=%h/.config/host-ingress/runtime
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=default.target

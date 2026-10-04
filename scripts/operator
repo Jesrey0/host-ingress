@@ -1,0 +1,490 @@
+#!/usr/bin/env node
+import { randomUUID } from 'node:crypto';
+import { chmodSync, closeSync, copyFileSync, existsSync, fchmodSync, fsyncSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { basename, join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { setTimeout as delay } from 'node:timers/promises';
+import { createInterface } from 'node:readline/promises';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { CHATGPT_CLIENT } from '../auth/chatgpt.mjs';
+import { openStore } from '../auth/store.mjs';
+import { DatabaseSync } from 'node:sqlite';
+
+const home = homedir();
+const config = join(home, '.config/host-ingress');
+const caddyBinary = join(home, '.local/bin/caddy');
+const caddyConfig = join(config, 'runtime/current/Caddyfile');
+const secretsFile = join(config, 'oauth-secrets.json');
+
+function command(binary, args, options = {}) {
+  const result = spawnSync(binary, args, { encoding: 'utf8', ...options });
+  if (result.error || result.status !== 0) {
+    throw new Error(`${binary} ${args.join(' ')} failed${result.status === null ? '' : ` (${result.status})`}`);
+  }
+  return result;
+}
+
+function active(service) {
+  const result = spawnSync('systemctl', ['--user', 'is-active', '--quiet', service], { stdio: 'ignore' });
+  return !result.error && result.status === 0;
+}
+
+function requirePrivateFile(path) {
+  const stat = statSync(path);
+  if (!stat.isFile() || (stat.mode & 0o777) !== 0o600) {
+    throw new Error(`${path} must be a regular file with mode 0600`);
+  }
+}
+
+function atomicWrite(path, contents) {
+  const temporary = `${path}.tmp-${process.pid}-${randomUUID()}`;
+  let descriptor;
+  try {
+    descriptor = openSync(temporary, 'wx', 0o600);
+    writeFileSync(descriptor, contents);
+    fchmodSync(descriptor, 0o600);
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
+    renameSync(temporary, path);
+  } catch (error) {
+    if (descriptor !== undefined) closeSync(descriptor);
+    try { unlinkSync(temporary); } catch { /* no temporary file remains */ }
+    throw error;
+  }
+}
+
+export function hashPassword(run = command) {
+  const result = run(caddyBinary, ['hash-password', '--algorithm', 'bcrypt'], {
+    stdio: ['inherit', 'pipe', 'inherit'],
+  });
+  const hashes = result.stdout.split(/\r?\n/).map((line) => line.trim())
+    .filter((line) => /^\$2[aby]\$\d\d\$[./A-Za-z0-9]{53}$/.test(line));
+  if (hashes.length !== 1) throw new Error('Caddy did not return exactly one bcrypt hash');
+  return hashes[0];
+}
+
+function validateCaddy(username, hash, run) {
+  run(caddyBinary, ['validate', '--config', caddyConfig, '--adapter', 'caddyfile'], {
+    env: { ...process.env, CODEX_CONNECT_BASIC_AUTH_USER: username, CODEX_CONNECT_BASIC_AUTH_HASH: hash },
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+}
+
+function validateUsername(username) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(username ?? '')) {
+    throw new Error('username must be 1–64 letters, digits, dots, underscores, or hyphens');
+  }
+}
+
+export function rotateBasicAuth({
+  envFile = join(config, 'env.caddy'), username, hash, run = command, isActive = active,
+} = {}) {
+  validateUsername(username);
+  requirePrivateFile(envFile);
+  if (!isActive('host-ingress.service')) throw new Error('host-ingress.service must be active before rotating credentials');
+
+  const original = readFileSync(envFile, 'utf8');
+  const newHash = hash;
+  if (!/^\$2[aby]\$\d\d\$[./A-Za-z0-9]{53}$/.test(newHash)) throw new Error('Caddy returned an invalid bcrypt hash');
+  const newContents = `CODEX_CONNECT_BASIC_AUTH_USER=${username}\nCODEX_CONNECT_BASIC_AUTH_HASH='${newHash}'\n`;
+  validateCaddy(username, newHash, run);
+
+  atomicWrite(envFile, newContents);
+  try {
+    run('systemctl', ['--user', 'reload', 'host-ingress.service']);
+    if (!isActive('host-ingress.service')) throw new Error('host-ingress.service is not active after reload');
+  } catch (error) {
+    try {
+      atomicWrite(envFile, original);
+    } catch {
+      throw new Error('credential rotation failed; restoring previous env.caddy also failed—the file may still contain the new credentials; check env.caddy and service status immediately');
+    }
+    try {
+      run('systemctl', ['--user', 'reload', 'host-ingress.service']);
+      if (!isActive('host-ingress.service')) throw new Error('old Caddy config did not return to active state');
+    } catch {
+      throw new Error('credential rotation failed; previous env.caddy was restored, but Caddy did not recover—check service status immediately');
+    }
+    throw new Error('credential rotation failed; previous env.caddy was restored and Caddy reloaded with the old credentials');
+  }
+}
+
+async function oauthReady() {
+  for (let attempt = 0; attempt < 40; attempt++) {
+    try {
+      const response = await fetch('http://127.0.0.1:9001/healthz', { signal: AbortSignal.timeout(500) });
+      if (response.ok) return true;
+    } catch { /* service may still be starting */ }
+    await delay(250);
+  }
+  return false;
+}
+
+async function restartOAuth(run, isActive, waitUntilReady) {
+  run('systemctl', ['--user', 'restart', 'host-oauth.service']);
+  if (!isActive('host-oauth.service') || !(await waitUntilReady())) throw new Error('host-oauth did not become healthy');
+}
+
+function requireDatabaseFiles(files) {
+  if (!Array.isArray(files) || !files.length || files.length > 2
+      || files.some((file) => typeof file !== 'string' || !file.endsWith('.sqlite'))
+      || new Set(files.map((file) => basename(file))).size !== files.length) throw new Error('Explicit, separate OAuth database files required');
+}
+
+function validateOAuthSet(secrets, dbFile) {
+  requirePrivateFile(secrets);
+  requirePrivateFile(dbFile);
+  const identity = JSON.parse(readFileSync(secrets, 'utf8'));
+  if (typeof identity?.accountId !== 'string' || !identity.accountId
+      || !Array.isArray(identity.jwks?.keys) || identity.jwks.keys.length === 0
+      || identity.jwks.keys.some((key) => !key || typeof key !== 'object' || typeof key.kty !== 'string')) {
+    throw new Error('OAuth signing identity contents are invalid');
+  }
+  validateDatabase(dbFile);
+}
+
+function validateDatabase(dbFile) {
+  requirePrivateFile(dbFile);
+  const db = new DatabaseSync(dbFile, { readOnly: true });
+  try {
+    const result = db.prepare('PRAGMA integrity_check').get();
+    if (!result || Object.values(result)[0] !== 'ok') throw new Error('OAuth database integrity check failed');
+    db.prepare('SELECT model, id, payload FROM artifacts LIMIT 0').all();
+  } finally { db.close(); }
+}
+
+function requireCurrentChatGPTAuthorization(dbFile) {
+  requirePrivateFile(dbFile);
+  const db = new DatabaseSync(dbFile, { readOnly: true });
+  try {
+    const nonCurrent = db.prepare(`
+      SELECT model, id
+        FROM artifacts
+       WHERE model IN ('Grant', 'RefreshToken')
+         AND json_extract(payload, '$.clientId') = ?
+         AND (expires IS NOT NULL OR json_type(payload, '$.exp') IS NOT NULL)
+       LIMIT 1
+    `).get(CHATGPT_CLIENT);
+    if (nonCurrent) {
+      throw new Error(`OAuth database contains non-current ChatGPT ${nonCurrent.model} authorization state`);
+    }
+  } finally { db.close(); }
+}
+
+function checkpointDatabase(path) {
+  const db = new DatabaseSync(path);
+  try {
+    const result = db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
+    if (result?.busy) throw new Error('SQLite could not checkpoint the OAuth database');
+  } finally { db.close(); }
+  syncPath(path);
+}
+
+function syncPath(path) {
+  const descriptor = openSync(path, 'r');
+  try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
+}
+
+function removeSqliteSidecars(path) {
+  for (const suffix of ['-wal', '-shm']) {
+    const sidecar = `${path}${suffix}`;
+    if (existsSync(sidecar)) rmSync(sidecar);
+  }
+  syncPath(join(path, '..'));
+}
+
+async function withOAuthStopped(run, isActive, waitUntilReady, action) {
+  if (!isActive('host-oauth.service')) throw new Error('host-oauth.service must be active before OAuth state maintenance');
+  try { run('systemctl', ['--user', 'stop', 'host-oauth.service']); }
+  catch (error) {
+    if (isActive('host-oauth.service')) throw new Error(`host-oauth stop failed; OAuth state was not changed: ${error.message}`);
+    try { await restartOAuth(run, isActive, waitUntilReady); }
+    catch { throw new Error('host-oauth stop failed and service recovery failed; OAuth state was not changed—check service status immediately'); }
+    throw new Error(`host-oauth stop failed; OAuth state was not changed and service recovered: ${error.message}`);
+  }
+  if (isActive('host-oauth.service')) throw new Error('host-oauth.service did not stop; OAuth state was not changed');
+  let actionError;
+  try { await action(); } catch (error) { actionError = error; }
+  let recoveryError;
+  try { await restartOAuth(run, isActive, waitUntilReady); } catch (error) { recoveryError = error; }
+  if (recoveryError) {
+    throw new Error(`host-oauth recovery failed after ${actionError ? 'maintenance failure' : 'state maintenance'}; inspect OAuth files and service health immediately${actionError ? ` (maintenance error: ${actionError.message})` : ''}`);
+  }
+  if (actionError) throw actionError;
+}
+
+export async function backupOAuth({ destination, secrets = secretsFile, databaseFiles, run = command,
+  isActive = active, waitUntilReady = oauthReady } = {}) {
+  if (!destination) throw new Error('backup destination is required');
+  requireDatabaseFiles(databaseFiles);
+  const target = join(destination);
+  if (existsSync(target)) throw new Error(`backup destination already exists: ${target}`);
+  await withOAuthStopped(run, isActive, waitUntilReady, async () => {
+    for (const file of databaseFiles) validateOAuthSet(secrets, file);
+    for (const file of databaseFiles) checkpointDatabase(file);
+    const parent = join(target, '..');
+    mkdirSync(parent, { recursive: true, mode: 0o700 });
+    const temporary = mkdtempSync(join(parent, '.oauth-backup-'));
+    try {
+      chmodSync(temporary, 0o700);
+      copyFileSync(secrets, join(temporary, 'oauth-secrets.json'), 0);
+      chmodSync(join(temporary, 'oauth-secrets.json'), 0o600);
+      syncPath(join(temporary, 'oauth-secrets.json'));
+      for (const file of databaseFiles) {
+        const saved = join(temporary, basename(file));
+        copyFileSync(file, saved, 0);
+        chmodSync(saved, 0o600);
+        validateOAuthSet(join(temporary, 'oauth-secrets.json'), saved);
+        syncPath(saved);
+      }
+      renameSync(temporary, target);
+      syncPath(parent);
+    } catch (error) {
+      rmSync(temporary, { recursive: true, force: true });
+      throw error;
+    }
+  });
+}
+
+export async function restoreOAuth({ source, secrets = secretsFile, databaseFiles, run = command,
+  isActive = active, waitUntilReady = oauthReady } = {}) {
+  if (!source) throw new Error('restore source is required');
+  requireDatabaseFiles(databaseFiles);
+  const backupSecrets = join(source, 'oauth-secrets.json');
+  for (const file of databaseFiles) {
+    const backupDatabase = join(source, basename(file));
+    validateOAuthSet(backupSecrets, backupDatabase);
+    requireCurrentChatGPTAuthorization(backupDatabase);
+  }
+  if (!isActive('host-oauth.service')) throw new Error('host-oauth.service must be active before OAuth restore');
+  try { run('systemctl', ['--user', 'stop', 'host-oauth.service']); }
+  catch (error) {
+    if (isActive('host-oauth.service')) throw new Error(`host-oauth stop failed; OAuth state was not changed: ${error.message}`);
+    try { await restartOAuth(run, isActive, waitUntilReady); }
+    catch { throw new Error('host-oauth stop failed and prior-state service recovery failed; OAuth state was not changed—check service status immediately'); }
+    throw new Error(`OAuth restore failed before changing files; prior state recovered: ${error.message}`);
+  }
+  if (isActive('host-oauth.service')) throw new Error('host-oauth.service did not stop; OAuth state was not changed');
+
+  let stageSecret;
+  const stageDbs = [];
+  let stages;
+  let installed = false;
+  try {
+    for (const file of databaseFiles) validateOAuthSet(secrets, file);
+    for (const file of databaseFiles) checkpointDatabase(file);
+    stageSecret = mkdtempSync(join(join(secrets, '..'), '.oauth-restore-'));
+    for (const file of databaseFiles) stageDbs.push(mkdtempSync(join(join(file, '..'), '.oauth-restore-')));
+    stages = [
+      { target: secrets, source: backupSecrets, next: join(stageSecret, 'next'), prior: join(stageSecret, 'prior') },
+      ...databaseFiles.map((file, index) => ({ target: file, source: join(source, basename(file)),
+        next: join(stageDbs[index], 'next'), prior: join(stageDbs[index], 'prior') })),
+    ];
+    for (const item of stages) {
+      copyFileSync(item.target, item.prior); copyFileSync(item.source, item.next);
+      chmodSync(item.prior, 0o600); chmodSync(item.next, 0o600);
+      syncPath(item.prior); syncPath(item.next);
+    }
+    databaseFiles.forEach(removeSqliteSidecars);
+    for (const item of stages) {
+      renameSync(item.next, item.target);
+      syncPath(join(item.target, '..'));
+    }
+    databaseFiles.forEach(removeSqliteSidecars);
+    databaseFiles.forEach((file) => validateOAuthSet(secrets, file));
+    try {
+      await restartOAuth(run, isActive, waitUntilReady);
+      installed = true;
+      return;
+    } catch (error) {
+      throw new Error(`restored OAuth service failed health verification: ${error.message}`);
+    }
+  } catch (restoreError) {
+    let recoveryError;
+    try {
+      if (isActive('host-oauth.service')) run('systemctl', ['--user', 'stop', 'host-oauth.service']);
+      if (isActive('host-oauth.service')) throw new Error('host-oauth remained active after stop');
+      databaseFiles.forEach(removeSqliteSidecars);
+      for (const item of [...(stages ?? [])].reverse()) {
+        if (!existsSync(item.prior)) continue;
+        const recovery = `${item.target}.restore-${process.pid}`;
+        copyFileSync(item.prior, recovery); chmodSync(recovery, 0o600); syncPath(recovery);
+        renameSync(recovery, item.target); syncPath(join(item.target, '..'));
+      }
+      databaseFiles.forEach(removeSqliteSidecars);
+      databaseFiles.forEach((file) => validateOAuthSet(secrets, file));
+      await restartOAuth(run, isActive, waitUntilReady);
+    } catch (error) {
+      recoveryError = error;
+    }
+    if (recoveryError) {
+      if (isActive('host-oauth.service')) {
+        try {
+          run('systemctl', ['--user', 'stop', 'host-oauth.service']);
+          if (isActive('host-oauth.service')) throw new Error('host-oauth remained active after recovery stop');
+        } catch (error) {
+          recoveryError = new Error(`${recoveryError.message}; could not leave host-oauth stopped (${error.message})`);
+        }
+      }
+      if (!isActive('host-oauth.service')) {
+        try {
+          databaseFiles.forEach(removeSqliteSidecars);
+          for (const item of [...(stages ?? [])].reverse()) {
+            if (!existsSync(item.prior)) continue;
+            const recovery = `${item.target}.restore-${process.pid}`;
+            copyFileSync(item.prior, recovery); chmodSync(recovery, 0o600); syncPath(recovery);
+            renameSync(recovery, item.target); syncPath(join(item.target, '..'));
+          }
+          databaseFiles.forEach(removeSqliteSidecars);
+          databaseFiles.forEach((file) => validateOAuthSet(secrets, file));
+        } catch (error) {
+          recoveryError = new Error(`${recoveryError.message}; reinstalling staged prior files also failed (${error.message})`);
+        }
+      }
+      throw new Error(`OAUTH RESTORE RECOVERY FAILED: restore failed (${restoreError.message}); prior state recovery also failed (${recoveryError.message}). host-oauth may be stopped; preserve and inspect staged evidence at ${stageSecret ?? '(secret staging unavailable)'} and ${stageDbs.length ? stageDbs.join(', ') : '(database staging unavailable)'}`);
+    }
+    if (stageSecret) rmSync(stageSecret, { recursive: true, force: true });
+    stageDbs.forEach((stage) => rmSync(stage, { recursive: true, force: true }));
+    throw new Error(`OAuth restore failed; prior identity/database pair was restored and host-oauth is healthy (${restoreError.message})`);
+  } finally {
+    if (installed) {
+      if (stageSecret) rmSync(stageSecret, { recursive: true, force: true });
+      stageDbs.forEach((stage) => rmSync(stage, { recursive: true, force: true }));
+    }
+  }
+}
+
+export async function revokeAllOAuth({
+  databaseFiles, run = command, isActive = active, waitUntilReady = oauthReady,
+} = {}) {
+  requireDatabaseFiles(databaseFiles);
+  databaseFiles.forEach(requirePrivateFile);
+  if (!isActive('host-oauth.service')) throw new Error('host-oauth.service must be active before revoking authorization');
+  try {
+    run('systemctl', ['--user', 'stop', 'host-oauth.service']);
+  } catch (error) {
+    if (isActive('host-oauth.service')) {
+      throw new Error(`host-oauth stop failed while the service remained active; no authorization state was changed: ${error.message}`);
+    }
+    try {
+      await restartOAuth(run, isActive, waitUntilReady);
+    } catch {
+      throw new Error('host-oauth stop failed after the service became inactive, and recovery failed; no authorization state was changed—check service status immediately');
+    }
+    throw new Error(`host-oauth stop failed after the service became inactive; no authorization state was changed and host-oauth recovered: ${error.message}`);
+  }
+  if (isActive('host-oauth.service')) throw new Error('host-oauth.service did not stop; no authorization state was changed');
+
+  let grants;
+  let revokeError;
+  try {
+    databaseFiles.forEach(validateDatabase);
+    grants = 0;
+    for (const file of databaseFiles) {
+      const store = openStore(file);
+      try { grants += store.revokeAll(); }
+      finally { store.close(); }
+    }
+  } catch (error) {
+    revokeError = error;
+  }
+
+  let recoveryError;
+  try {
+    await restartOAuth(run, isActive, waitUntilReady);
+  } catch (error) {
+    recoveryError = error;
+  }
+  if (recoveryError) {
+    throw new Error(`host-oauth recovery failed${grants === undefined ? '; authorization state was not confirmed revoked' : '; authorization was revoked'}—check service status immediately`);
+  }
+  if (revokeError) throw new Error(`OAuth revoke-all failed; host-oauth was restarted: ${revokeError.message}`);
+  return grants;
+}
+
+async function confirmQuestion(label) {
+  const readline = createInterface({ input: process.stdin, output: process.stdout });
+  try { return await readline.question(label); }
+  finally { readline.close(); }
+}
+
+const help = `Usage: ./scripts/operator <command>
+
+Commands:
+  status              Show deployed ingress and service status
+  basic rotate USER   Replace the consent-page Basic Auth login interactively
+  oauth revoke-all    Revoke all OAuth grants/tokens and clear pending sessions
+  oauth backup DIR   Save a private, stopped-service snapshot of identity and grants
+  oauth restore DIR  Replace OAuth identity and grants from a backup directory
+  network status      Show tracked source assurance mode, snapshot age and validity
+  network refresh     Explicitly refresh only the tracked OpenAI network snapshot
+  help                Show this help
+
+Basic Auth usernames are explicit non-secret arguments. Caddy prompts for the
+password without echo and hashes it from its own terminal input. Passwords are
+never argv.
+OAuth revoke-all keeps client-assertion replay records but removes all current
+and pending authorization state for the single operator identity.
+OAuth backup directories contain oauth-secrets.json, oauth.sqlite and
+opencode-connect-oauth.sqlite (mode 0600)
+inside a mode-0700 directory. Maintenance covers both deployed profiles; restore
+replaces the shared identity and both databases. Never restore only one app with new keys.
+`;
+
+async function main(args) {
+  const [area, operation, ...extra] = args;
+  if (!area || area === 'help') { process.stdout.write(help); return; }
+  if (area === 'status' && !operation && !extra.length) {
+    command(fileURLToPath(new URL('./status', import.meta.url)), [], { stdio: 'inherit' });
+    return;
+  }
+  if (area === 'network' && ['status', 'refresh'].includes(operation) && !extra.length) {
+    const { networkCommand } = await import('./network.mjs');
+    await networkCommand(operation);
+    return;
+  }
+  if (area === 'basic' && operation === 'rotate' && extra.length === 1) {
+    const username = extra[0];
+    validateUsername(username);
+    requirePrivateFile(join(config, 'env.caddy'));
+    if (!active('host-ingress.service')) throw new Error('host-ingress.service must be active before rotating credentials');
+    const hash = hashPassword();
+    rotateBasicAuth({ username, hash });
+    process.stdout.write('Consent-page Basic Auth credentials updated; Caddy reloaded.\n');
+    return;
+  }
+  const databaseFiles = area === 'oauth'
+    ? (await import(pathToFileURL(join(config, 'runtime/current/lib/apps.mjs')))).loadApps()
+      .map((app) => join(home, '.local/state/host-ingress', app.oauth.database)) : [];
+  if (area === 'oauth' && operation === 'revoke-all' && !extra.length) {
+    process.stdout.write('This revokes OAuth access/refresh tokens and clears pending logins for both deployed profiles of the single operator identity.\n');
+    const confirmation = await confirmQuestion('Type revoke-all to continue: ');
+    if (confirmation !== 'revoke-all') throw new Error('confirmation did not match; nothing was changed');
+    const grants = await revokeAllOAuth({ databaseFiles });
+    process.stdout.write(`Revoked all OAuth authorization state (${grants} stored grants).\n`);
+    return;
+  }
+  if (area === 'oauth' && operation === 'backup' && extra.length === 1) {
+    await backupOAuth({ destination: extra[0], databaseFiles });
+    process.stdout.write(`OAuth identity and database backed up to ${extra[0]}\n`);
+    return;
+  }
+  if (area === 'oauth' && operation === 'restore' && extra.length === 1) {
+    process.stdout.write('This replaces the shared OAuth signing identity and both deployed authorization databases.\n');
+    const confirmation = await confirmQuestion('Type restore to continue: ');
+    if (confirmation !== 'restore') throw new Error('confirmation did not match; nothing was changed');
+    await restoreOAuth({ source: extra[0], databaseFiles });
+    process.stdout.write('OAuth identity and database restored; host-oauth is healthy.\n');
+    return;
+  }
+  throw new Error(`unknown command; run ./scripts/operator help`);
+}
+
+if (import.meta.main) {
+  main(process.argv.slice(2)).catch((error) => {
+    process.stderr.write(`operator: ${error.message}\n`);
+    process.exitCode = 1;
+  });
+}

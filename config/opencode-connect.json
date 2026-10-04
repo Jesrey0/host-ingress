@@ -1,0 +1,24 @@
+{
+  "id": "opencode-connect",
+  "title": "OpenCode Connect",
+  "description": "Allow ChatGPT to access this host through OpenCode Connect, including host operations and OpenCode sessions.",
+  "resource": {
+    "path": "/opencode-connect/mcp",
+    "upstreamPath": "/mcp",
+    "scope": "opencode-connect:access"
+  },
+  "oauth": {
+    "path": "/opencode-connect/oauth",
+    "database": "opencode-connect-oauth.sqlite",
+    "cookies": {
+      "session": "_opencode_session",
+      "interaction": "_opencode_interaction",
+      "resume": "_opencode_interaction_resume"
+    }
+  },
+  "backend": {
+    "port": 8788,
+    "service": "opencode-connect.service",
+    "healthPath": "/health"
+  }
+}

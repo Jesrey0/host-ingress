@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+env_file="${HOME}/.config/host-ingress/env.oauth"
+ngrok_env_file="${HOME}/.config/host-ingress/env.ngrok"
+caddy_env_file="${HOME}/.config/host-ingress/env.caddy"
+runtime_root="${HOME}/.config/host-ingress/runtime/current"
+failures=0
+
+for service_env in "${env_file}" "${ngrok_env_file}" "${caddy_env_file}"; do
+  [[ -f "${service_env}" ]] || { echo "missing ${service_env}" >&2; exit 1; }
+  [[ "$(stat -c '%a' "${service_env}")" == "600" ]] || { echo "${service_env} must have mode 0600" >&2; exit 1; }
+done
+
+# Report deployed state from the selected immutable release.
+live_origin="${runtime_root}/lib/origin.mjs"
+live_apps="${runtime_root}/lib/apps.mjs"
+live_transport="${runtime_root}/transport/ngrok/transport.mjs"
+live_check_apps="${runtime_root}/scripts/check-apps.mjs"
+if [[ ! -f "${live_origin}" || ! -f "${live_apps}" || ! -f "${runtime_root}/config/codex-connect.json" || ! -f "${runtime_root}/config/opencode-connect.json" || ! -f "${live_transport}" || ! -f "${live_check_apps}" ]]; then
+  echo "installed Connect runtime is incomplete" >&2
+  exit 1
+fi
+origin_from_env() {
+  local file="$1"
+  (
+    unset PUBLIC_ORIGIN
+    set -a
+    # shellcheck disable=SC1090
+    source "${file}"
+    set +a
+    node "${live_origin}"
+  )
+}
+expected_url="$(origin_from_env "${env_file}")"
+ngrok_expected_url="$(origin_from_env "${ngrok_env_file}")"
+if [[ "${ngrok_expected_url}" != "${expected_url}" ]]; then
+  echo "env.ngrok and env.oauth PUBLIC_ORIGIN values must match" >&2
+  exit 1
+fi
+export PUBLIC_ORIGIN="${expected_url}"
+apps="$(node "${live_apps}")"
+
+echo "managed ingress"
+printf '%-28s %s\n' "active profiles" "Codex Connect, OpenCode Connect"
+printf '%-28s ' "ngrok agent config"
+if node "${live_transport}" validate >/dev/null; then
+  echo "agent-only"
+else
+  echo "INVALID"
+  failures=$((failures + 1))
+fi
+for unit in host-oauth.service host-ingress.service host-ngrok.service; do
+  printf '%-28s ' "${unit}"
+  if systemctl --user is-active --quiet "${unit}"; then
+    echo active
+  else
+    systemctl --user is-active "${unit}" 2>/dev/null || true
+    failures=$((failures + 1))
+  fi
+done
+
+echo
+echo "configured route backends"
+while IFS=$'\t' read -r app unit port health resource; do
+  printf '%-28s ' "${unit}"
+  systemctl --user is-active "${unit}" 2>/dev/null || true
+  if ! curl -fsS --max-time 2 "http://127.0.0.1:${port}${health}" >/dev/null; then
+    echo "${app}: backend readiness failed (ingress and sibling remain independent)"
+  fi
+  echo "${app}: ${expected_url}${resource} (private 127.0.0.1:${port}${health})"
+done <<<"${apps}"
+
+echo
+echo "runtime identity"
+node "${runtime_root}/scripts/network.mjs" status || failures=$((failures + 1))
+if [[ -f "${runtime_root}/release-manifest.json" ]]; then
+  node - "${runtime_root}/release-manifest.json" <<'NODE'
+const fs = require('fs');
+const manifest = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+console.log(`Release: ${manifest.releaseId ?? 'unknown'}`);
+console.log(`Git SHA: ${manifest.gitSha ?? 'unknown'}`);
+console.log(`Content SHA-256: ${manifest.contentSha256 ?? 'unknown'}`);
+NODE
+  expected_digest="$(node -e 'const fs=require("fs"); const p=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); process.stdout.write(p.contentSha256 || "")' "${runtime_root}/release-manifest.json")"
+  actual_digest="$("${root}/scripts/release-digest" "${runtime_root}")"
+  if [[ -n "${expected_digest}" && "${expected_digest}" == "${actual_digest}" ]]; then
+    echo "Runtime digest: verified"
+  else
+    echo "Runtime digest: MISMATCH"
+    failures=$((failures + 1))
+  fi
+else
+  echo "Release manifest: missing"
+  failures=$((failures + 1))
+fi
+
+echo
+echo "public ingress"
+node "${live_transport}" status || failures=$((failures + 1))
+node "${live_check_apps}" gates-local || failures=$((failures + 1))
+node "${live_check_apps}" gates-public || failures=$((failures + 1))
+exit "${failures}"

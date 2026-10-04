@@ -1,0 +1,56 @@
+{
+	admin 127.0.0.1:2019
+	log {
+		format filter {
+			request>headers delete
+			request>uri delete
+			resp_headers delete
+			wrap json
+		}
+	}
+	servers {
+		trusted_proxies static 127.0.0.1/32 ::1/128
+		trusted_proxies_strict
+		client_ip_headers X-Forwarded-For
+	}
+}
+
+import assurance.caddy
+
+:9000 {
+	bind 127.0.0.1
+
+	log {
+		output file {env.HOME}/.local/state/host-ingress/logs/access.log {
+			roll_size 5mb
+			roll_keep 3
+		}
+		format filter {
+			request>headers delete
+			request>uri delete
+			resp_headers delete
+			wrap json
+		}
+	}
+
+	@robots path /robots.txt
+	log_skip @robots
+
+	route {
+		request_header -X-Host-Ingress-*
+		handle @robots {
+			respond <<ROBOTS
+				User-agent: *
+				Disallow: /
+				ROBOTS 200
+		}
+
+		import apps.caddy
+
+		handle {
+			@xff_probe path_regexp xff_probe ^/__host-ingress-xff-probe/([a-f0-9]{32})$
+			log_append @xff_probe xff_probe {re.xff_probe.1}
+			respond "Not Found" 404
+		}
+	}
+}

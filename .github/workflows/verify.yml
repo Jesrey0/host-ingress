@@ -1,0 +1,33 @@
+name: verify
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24.16.0
+          cache: npm
+      - name: Install Caddy test binary
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl --fail --location --silent --show-error \
+            https://github.com/caddyserver/caddy/releases/download/v2.11.4/caddy_2.11.4_linux_amd64.tar.gz \
+            | tar -xz -C "$HOME/.local/bin" caddy
+          "$HOME/.local/bin/caddy" version
+      - run: npm ci --ignore-scripts --no-fund --no-audit
+      - run: npm test
+      - run: |
+          node scripts/render-caddy.mjs "$RUNNER_TEMP/host-ingress"
+          "$HOME/.local/bin/caddy" validate --config "$RUNNER_TEMP/host-ingress/Caddyfile" --adapter caddyfile
+      - run: bash -n scripts/check scripts/deploy scripts/status
+      - run: python3 -m py_compile scripts/release-digest
+      - run: npm audit --omit=dev

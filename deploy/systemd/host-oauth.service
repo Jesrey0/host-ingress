@@ -1,0 +1,38 @@
+# Managed by host-ingress; install with scripts/deploy.
+[Unit]
+Description=Host ingress OAuth authorization and MCP token validation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/host-ingress/env.oauth
+Environment=NODE_ENV=production
+ExecStart=%h/.local/bin/node %h/.config/host-ingress/runtime/current/auth/server.mjs
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectHome=tmpfs
+BindReadOnlyPaths=%h/.local/bin/node
+BindReadOnlyPaths=%h/.nvm/versions/node
+BindReadOnlyPaths=%h/.config/host-ingress/runtime
+BindReadOnlyPaths=%h/.config/host-ingress/oauth-secrets.json
+BindPaths=%h/.local/state/host-ingress
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=default.target

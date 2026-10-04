@@ -1,0 +1,39 @@
+# Managed by host-ingress; install with scripts/deploy.
+[Unit]
+Description=Host ingress gateway (Caddy, loopback only)
+After=network.target host-oauth.service
+Wants=host-oauth.service
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/host-ingress/env.caddy
+ExecStartPre=%h/.local/bin/caddy validate --config %h/.config/host-ingress/runtime/current/Caddyfile --adapter caddyfile
+ExecStart=%h/.local/bin/caddy run --config %h/.config/host-ingress/runtime/current/Caddyfile --adapter caddyfile
+ExecReload=%h/.local/bin/caddy reload --config %h/.config/host-ingress/runtime/current/Caddyfile --adapter caddyfile
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectHome=tmpfs
+BindReadOnlyPaths=%h/.local/bin/caddy
+BindReadOnlyPaths=%h/.config/host-ingress/runtime
+BindPaths=%h/.local/state/host-ingress/logs %h/.config/caddy %h/.local/share/caddy
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=default.target

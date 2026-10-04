@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+config="${1:-${HOME}/.config/ngrok/ngrok.yml}"
+
+if [[ ! -f "${config}" ]]; then
+  echo "missing ngrok agent config ${config}" >&2
+  exit 1
+fi
+
+if [[ "$(stat -c '%a' "${config}")" != "600" ]]; then
+  echo "ngrok agent config must have mode 0600: ${config}" >&2
+  exit 1
+fi
+
+# host-ingress is the sole owner of the public endpoint/tunnel definition.
+# Keep ngrok.yml limited to agent/account settings so `ngrok start <name>`
+# cannot become a second source of truth for public ingress.
+if grep -Eq '^(tunnels|endpoints):([[:space:]]|$)' "${config}"; then
+  echo "${config} must contain agent/account settings only; host-ingress owns ngrok endpoint and tunnel definitions" >&2
+  exit 1
+fi

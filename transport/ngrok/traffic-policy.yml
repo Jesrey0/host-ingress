@@ -1,0 +1,33 @@
+on_http_request:
+  # Consent pages use the operator's browser login; constrain guessing at the edge.
+  - expressions:
+      - req.url.path.startsWith('/codex-connect/oauth/interaction/') || req.url.path.startsWith('/opencode-connect/oauth/interaction/')
+    actions:
+      - type: rate-limit
+        config:
+          name: host-ingress-consent-per-ip
+          algorithm: sliding_window
+          capacity: 20
+          rate: 60s
+          bucket_key:
+            - conn.client_ip
+          enforce: true
+  # Broad abuse ceiling. Normal MCP traffic should remain far below this.
+  - actions:
+      - type: rate-limit
+        config:
+          name: host-ingress-global-per-ip
+          algorithm: sliding_window
+          capacity: 600
+          rate: 60s
+          bucket_key:
+            - conn.client_ip
+          enforce: true
+
+on_http_response:
+  - actions:
+      - type: add-headers
+        config:
+          headers:
+            strict-transport-security: max-age=31536000
+            x-host-ingress-policy: ngrok-edge-v2

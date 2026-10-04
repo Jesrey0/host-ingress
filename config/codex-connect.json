@@ -1,0 +1,12 @@
+{
+  "id": "codex-connect",
+  "title": "Codex Connect",
+  "description": "Allow ChatGPT to access this host through Codex Connect, including files, commands, and Codex workers.",
+  "resource": { "path": "/codex-connect/mcp", "upstreamPath": "/mcp", "scope": "codex-connect:access" },
+  "oauth": {
+    "path": "/codex-connect/oauth",
+    "database": "oauth.sqlite",
+    "cookies": { "session": "_session", "interaction": "_interaction", "resume": "_interaction_resume" }
+  },
+  "backend": { "port": 8767, "service": "codex-connect.service", "healthPath": "/healthz" }
+}

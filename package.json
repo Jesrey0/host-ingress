@@ -1,0 +1,8 @@
+{
+  "name": "host-ingress",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24.16.0" },
+  "scripts": { "test": "node --test tests/*.test.mjs" },
+  "dependencies": { "oidc-provider": "9.12.2" }
+}

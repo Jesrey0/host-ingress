@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+runtime_root="${HOME}/.config/host-ingress/runtime/current"
+env_file="${HOME}/.config/host-ingress/env.oauth"
+ngrok_env_file="${HOME}/.config/host-ingress/env.ngrok"
+caddy_env_file="${HOME}/.config/host-ingress/env.caddy"
+caddy_bin="${HOME}/.local/bin/caddy"
+scope="${1:-all}"
+case "${scope}" in
+  all|source|ingress|backend) ;;
+  *) echo "usage: $0 [all|source|ingress|backend]" >&2; exit 2 ;;
+esac
+
+if [[ "${scope}" != backend ]]; then
+  for service_env in "${ngrok_env_file}" "${env_file}" "${caddy_env_file}"; do
+    [[ -f "${service_env}" ]] || { echo "missing ${service_env}" >&2; exit 1; }
+    [[ "$(stat -c '%a' "${service_env}")" == "600" ]] || { echo "${service_env} must have mode 0600" >&2; exit 1; }
+  done
+  origin_from_env() {
+    local file="$1"
+    (
+      unset PUBLIC_ORIGIN
+      set -a
+      # shellcheck disable=SC1090
+      source "${file}"
+      set +a
+      node "${root}/lib/origin.mjs"
+    )
+  }
+  oauth_origin="$(origin_from_env "${env_file}")"
+  ngrok_origin="$(origin_from_env "${ngrok_env_file}")"
+  [[ "${oauth_origin}" == "${ngrok_origin}" ]] || {
+    echo "env.oauth and env.ngrok PUBLIC_ORIGIN values must match" >&2
+    exit 1
+  }
+  set -a
+  # shellcheck disable=SC1090
+  source "${env_file}"
+  set +a
+  node "${root}/lib/origin.mjs" >/dev/null
+  node "${root}/transport/ngrok/transport.mjs" validate
+  validate_caddy() {
+    local config="$1"
+    local log_home="${2:-${HOME}}"
+    (
+      unset CODEX_CONNECT_BASIC_AUTH_USER CODEX_CONNECT_BASIC_AUTH_HASH
+      set -a
+      # shellcheck disable=SC1090
+      source "${caddy_env_file}"
+      set +a
+      HOME="${log_home}" "${caddy_bin}" validate --config "${config}" --adapter caddyfile >/dev/null
+    )
+  }
+  source_config="$(mktemp -d)"
+  trap 'rm -rf -- "${source_config}"' EXIT
+  node "${root}/scripts/render-caddy.mjs" "${source_config}"
+  echo "validating tracked source"
+  mkdir -p "${source_config}/.local/state/host-ingress/logs"
+  validate_caddy "${source_config}/Caddyfile" "${source_config}"
+  if [[ "${scope}" == source ]]; then
+    npm --prefix "${root}" test
+    mkdir -m 0700 "${source_config}/systemd-runtime"
+    XDG_RUNTIME_DIR="${source_config}/systemd-runtime" systemd-analyze --user verify "${root}"/deploy/systemd/*.service
+    exit 0
+  fi
+  echo "validating installed runtime"
+  node "${runtime_root}/scripts/network.mjs" status
+  validate_caddy "${runtime_root}/Caddyfile"
+  expected_digest="$(node -e 'const fs=require("fs"); const p=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); process.stdout.write(p.contentSha256 || "")' "${runtime_root}/release-manifest.json")"
+  actual_digest="$("${root}/scripts/release-digest" "${runtime_root}")"
+  [[ -n "${expected_digest}" && "${expected_digest}" == "${actual_digest}" ]] || { echo "installed runtime digest mismatch" >&2; exit 1; }
+fi
+
+if [[ "${scope}" == all || "${scope}" == backend ]]; then
+  node "${runtime_root}/scripts/check-apps.mjs" backend
+fi
+if [[ "${scope}" == all || "${scope}" == ingress ]]; then
+  node "${runtime_root}/scripts/check-apps.mjs" ingress
+fi
+if [[ "${CHECK_PUBLIC:-0}" == 1 && "${scope}" != backend ]]; then
+  node "${root}/transport/ngrok/transport.mjs" status
+  node "${runtime_root}/scripts/check-apps.mjs" public
+fi
