@@ -67,6 +67,13 @@ test('managed services hide home and expose only explicit host paths', () => {
   assert.match(oauth, /BindPaths=%h\/\.local\/state\/host-ingress/);
 });
 
+test('shared OAuth restarts after clean exits as well as failures', () => {
+  const oauth = text('deploy/systemd/host-oauth.service');
+  assert.match(oauth, /^Restart=always$/m);
+  assert.match(oauth, /^RestartSec=3$/m);
+  assert.doesNotMatch(oauth, /^RestartPreventExitStatus=/m);
+});
+
 test('deployment preserves live ingress when service definitions are unchanged', () => {
   const deploy = text('scripts/deploy');
   const sourceCheck = text('scripts/check');

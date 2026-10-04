@@ -9,7 +9,9 @@ Type=simple
 EnvironmentFile=%h/.config/host-ingress/env.oauth
 Environment=NODE_ENV=production
 ExecStart=%h/.local/bin/node %h/.config/host-ingress/runtime/current/auth/server.mjs
-Restart=on-failure
+# A graceful unexpected exit must not leave both MCP auth gates unavailable.
+# Explicit systemctl stop still suppresses automatic restart.
+Restart=always
 RestartSec=3
 NoNewPrivileges=true
 PrivateTmp=true

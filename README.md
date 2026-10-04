@@ -385,7 +385,10 @@ command/process APIs, worker/action flows, and idle reconnect from the connector
 A small 5 × status / 5 × inspect sanity check is sufficient for transport latency.
 
 Startup ordering is ngrok → wants Caddy → wants host-oauth. Each service is enabled
-and independently restartable with `Restart=on-failure`. Each Connect backend starts
+and independently restartable. Shared OAuth uses `Restart=always` with a three-second
+retry delay so unexpected clean exits also recover; explicit `systemctl --user stop
+host-oauth.service` still leaves it stopped for maintenance. Caddy and ngrok use
+`Restart=on-failure`. Each Connect backend starts
 under its own independently managed service. While auth is unavailable Caddy fails closed;
 while one backend is unavailable its authorized MCP calls fail until it recovers,
 while the sibling remains usable.
