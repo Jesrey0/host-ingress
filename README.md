@@ -69,6 +69,24 @@ readiness, and a working ChatGPT connection are independently verified states.
 | OAuth discovery, authorization, token, revocation, public keys | `127.0.0.1:9001` | OAuth protocol validation |
 | Caddy gateway | `127.0.0.1:9000` | Exact declared routes; default deny |
 
+Ingress owns **routes and authentication**, not a per-tool proxy allowlist or
+the implementation of either backend. The OpenCode resource also carries
+`computer.*` (Windows desktop interaction) and `print.*` (Windows printer)
+HostPlane tools. They remain under the same protected
+`/opencode-connect/mcp` route and require the separate Windows components
+documented in [OpenCode Computer Use](https://github.com/Jesrey0/opencode-connect/blob/main/docs/computer-use.md)
+and [Printing HostPlane](https://github.com/Jesrey0/opencode-connect/blob/main/docs/printing.md).
+An authenticated tool listing does **not** prove the Windows desktop, paper
+tray, printer, or bridge is operational. Codex's independent tool/deployment
+contract lives in [Codex Connect operations](https://github.com/Jesrey0/codex-connect/blob/main/docs/operations.md).
+
+Ingress deployments never activate the two backend services; backend source
+changes, Git publication, service activation, ChatGPT plugin discovery, and
+physical Windows device acceptance are separate verification steps. Ingress
+status reports backend readiness independently of route/edge readiness and
+does not prove a ChatGPT event-triggered Scheduled task exists.
+
+
 Public application paths are project-namespaced. The only root-level exceptions
 are protected-resource and authorization-server discovery for each declared app.
 `/mcp`, `/status`, `/health`, `/healthz`, `/verify`, all internal auth-check paths,
